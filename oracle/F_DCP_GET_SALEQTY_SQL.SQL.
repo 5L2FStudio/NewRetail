@@ -1,0 +1,220 @@
+create or replace FUNCTION "F_DCP_GET_SALEQTY_SQL" (
+P_EID IN VARCHAR2,    --企业
+P_PluNo IN VARCHAR2,    --品号 或 MastPluNo
+P_FeatureNo IN VARCHAR2,  --特征码 空格或空表示不区分特征码
+P_OrgID IN VARCHAR2,    --组织  空则表示不区分机构，取总量
+P_ChannelID IN VARCHAR2,  --渠道  
+P_WAREHOUSE IN VARCHAR2,  --仓库  空则表示不区分仓库，取机构的总量。
+P_SUnit IN VARCHAR2   --交易单位
+) 
+RETURN NUMBER 
+IS
+--------------------------------------------------------------------------------
+--说明　　 : 获取可售量
+--数据流说明:
+--创建者   : JW
+--创建时间 : 2020-06-10
+--修改记录流水:
+--修改人        
+--返回：换算率
+--调用：select F_DCP_GET_SALEQTY('99','001','00101','01','01','01','KG') from dual
+--P_WAREHOUSE 支持不传 取机构的总库存
+--P_OrgID 支持不传 取渠道的总库存
+--------------------------------------------------------------------------------
+
+V_BreakPoint      VARCHAR2(255);
+V_Err       INTEGER;
+V_Msg       VARCHAR2(255);
+
+
+
+
+V_Temp    VARCHAR2(64);
+
+V_BASEUNIT  VARCHAR2(32);
+
+V_OnlineMode  INTEGER;
+V_OnlineQty NUMBER(18,4);
+V_OnlineUnit  VARCHAR2(32);
+
+V_Qty   NUMBER(18,4);
+
+V_TempCount INTEGER;
+
+V_SQL1               VARCHAR2(2000); 
+V_CHANNELSQL         VARCHAR2(2000); 
+
+V_SQL               VARCHAR2(2000); 
+
+V_MASTERPLUNO VARCHAR2(32);   
+
+V_STOCKCONTROL  INTEGER;
+  
+BEGIN
+  V_Err := -20001;
+  V_BreakPoint := 'F_DCP_GET_SALEQTY_010';
+  
+  
+  IF P_ChannelID is not null THEN
+    BEGIN
+      SELECT NVL(STOCKCONTROL,1) INTO V_STOCKCONTROL
+      FROM CRM_CHANNEL WHERE EID = P_EID AND CHANNELID = P_ChannelID;
+      IF V_STOCKCONTROL = 0 THEN
+        RETURN 999999;
+      END IF;
+    EXCEPTION WHEN NO_DATA_FOUND THEN
+      null;
+    END;    
+  END IF; 
+  
+    --商品临时表
+    --CREATE GLOBAL TEMPORARY TABLE TMP_GOODSRANGE 
+    -- (
+    --  PLUNO VARCHAR2(50), 
+    --  FEATURENO VARCHAR2(64),
+    --  UNIT VARCHAR2(64)
+    -- ) ON COMMIT DELETE ROWS 
+  
+    --库存量临时表
+    --CREATE GLOBAL TEMPORARY TABLE TMP_GOODSSTOCK 
+    -- (
+    --  PLUNO VARCHAR2(50), 
+    --  FEATURENO VARCHAR2(64),
+    --  UNIT VARCHAR2(32),
+    --  QTY NUMBER(23,8),
+    --  TOUNIT VARCHAR2(32)
+    -- ) ON COMMIT DELETE ROWS 
+
+  INSERT INTO TMP_GOODSRANGE(
+    PLUNO,  FEATURENO,  UNIT
+  )
+  SELECT 
+    A.PLUNO,  '', A.UNIT    
+  FROM DCP_MSPECGOODS_SUBGOODS A
+  LEFT JOIN DCP_GOODS_ONLINE B
+    ON A.EID = B.EID
+    AND A.MASTERPLUNO=B.PLUNO
+  WHERE A.EID = P_EID 
+    AND A.MASTERPLUNO = P_PluNo AND B.PLUTYPE = 'MULTISPEC';
+    
+  --DCP_MSPECGOODS_SUBGOODS 中的 FEATURENO 是不能用的
+
+  SELECT count(*) INTO V_TempCount FROM TMP_GOODSRANGE;
+  IF V_TempCount <= 0 THEN
+    INSERT INTO TMP_GOODSRANGE(
+      PLUNO,  FEATURENO,  UNIT
+    )
+    VALUES
+    (
+      P_PLUNO,  P_FeatureNo,  P_SUnit
+    );    
+  END IF; 
+  
+  FOR C1 IN
+  (
+  SELECT DISTINCT PLUNO,FEATURENO,UNIT
+    FROM TMP_GOODSRANGE
+  )
+  LOOP
+    --1.判断这个渠道的商品是上架模式还是共享模式
+    BEGIN
+      SELECT PLUNO INTO V_Temp 
+       FROM DCP_STOCK_CHANNEL_WHITE
+      WHERE EID = P_EID
+        AND PLUNO = C1.PluNo
+        AND CHANNELID = P_ChannelID;
+      V_OnlineMode := 1; 
+    EXCEPTION WHEN NO_DATA_FOUND THEN
+      V_OnlineMode := 0;
+    END;  
+  
+  
+  
+    --2.如果是上架模式，可售量取渠道的上架量（上架模式的虚拟库存，在下单时就减掉）
+    IF V_OnlineMode = 1 THEN
+      
+      V_SQL1 := 'INSERT INTO TMP_GOODSSTOCK(PLUNO,FEATURENO,UNIT,QTY,TOUNIT) SELECT PLUNO,FEATURENO,SUNIT,ONLINEQTY,'''||C1.UNIT|| ''' FROM DCP_STOCK_CHANNEL' 
+               ||' WHERE EID = ''' || P_EID || ''' and PLUNO = ''' || C1.PluNO || '''';
+  
+      IF C1.FeatureNo is not null and C1.FeatureNo <> ' ' THEN
+        V_SQL1 := V_SQL1 || ' AND FEATURENO = '''||C1.FeatureNo||'''';
+      END IF;         
+      
+      IF P_OrgID is not null THEN
+        V_SQL1 := V_SQL1 || ' AND ORGANIZATIONNO = '''||P_OrgID||'''';
+      END IF; 
+         
+      IF P_WAREHOUSE is not null THEN
+        V_SQL1 := V_SQL1 || ' AND WAREHOUSE = '''||P_WAREHOUSE||'''';
+      END IF; 
+          
+      V_CHANNELSQL := ' AND CHANNELID = '''||P_ChannelID||'''';   
+      V_SQL := V_SQL1 || V_CHANNELSQL;    
+      EXECUTE IMMEDIATE V_SQL; 
+      
+      SELECT COUNT(*) INTO V_TempCount FROM TMP_GOODSSTOCK;
+      
+      IF V_TempCount = 0 THEN
+        --2.2 如果没有，则取不限定渠道的上架量 'all'
+        V_CHANNELSQL := ' AND CHANNELID = ''all''';   
+        V_SQL := V_SQL1 || V_CHANNELSQL;    
+        EXECUTE IMMEDIATE V_SQL;      
+      END IF; 
+  
+    END IF;
+    
+    --3.如果是共享库存模式，取库存表（共享模式共享的是实物库存，在下单时就不减掉，只锁定，出货时减）
+    IF V_OnlineMode = 0 THEN
+      
+      V_SQL1 := 'INSERT INTO TMP_GOODSSTOCK(PLUNO,FEATURENO,UNIT,QTY,TOUNIT) SELECT PLUNO,FEATURENO,BASEUNIT,QTY-ONLINEQTY-LOCKQTY,'''||C1.UNIT||''' FROM DCP_STOCK' 
+               ||' WHERE EID = ''' || P_EID || ''' and PLUNO = ''' || C1.PluNO || '''';
+  
+      IF C1.FeatureNo is not null and C1.FeatureNo <> ' ' THEN
+        V_SQL1 := V_SQL1 || ' AND FEATURENO = '''||C1.FeatureNo||'''';
+      END IF;         
+      
+      IF P_OrgID is not null THEN
+        V_SQL1 := V_SQL1 || ' AND ORGANIZATIONNO = '''||P_OrgID||'''';
+      END IF; 
+         
+      IF P_WAREHOUSE is not null THEN
+        V_SQL1 := V_SQL1 || ' AND WAREHOUSE = '''||P_WAREHOUSE||'''';
+      END IF; 
+          
+      V_SQL := V_SQL1;    
+      EXECUTE IMMEDIATE V_SQL; 
+      
+    END IF; 
+
+  END LOOP;
+
+
+  V_Qty := 0;
+  FOR C1 IN
+  (
+  SELECT PLUNO,UNIT OnlineUnit,TOUNIT,NVL(SUM(QTY),0) OnlineQty
+    FROM TMP_GOODSSTOCK   
+     GROUP BY PLUNO,UNIT,TOUNIT
+  )
+  LOOP
+    V_OnlineUnit := C1.OnlineUnit;
+    V_OnlineQty := C1.OnlineQty;
+    IF V_OnlineQty <> 0 THEN
+      V_Qty := V_Qty + F_DCP_UnitConvert(P_EID,C1.PLUNO,V_OnlineUnit,C1.TOUNIT,V_OnlineQty);          
+    END IF;
+  END LOOP;   
+
+  --取单位上的小数位数   
+  RETURN V_Qty; 
+
+
+
+  
+
+
+
+EXCEPTION WHEN OTHERS THEN
+  Raise_Application_Error(-20001, v_BreakPoint || '-'|| SQLERRM);  
+
+  
+END;
